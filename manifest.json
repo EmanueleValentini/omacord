@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.emanuelevalentini.omacord",
+  "name": "Omacord",
+  "version": "0.1.0",
+  "author": "Emanuele Valentini",
+  "license": "MIT",
+  "description": "Discord voice state, mute controls and mentions in the bar, with a panel for the whole picture",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Discord",
+    "description": "Voice channel, mic state and mentions from the running Discord client",
+    "category": "Communication",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

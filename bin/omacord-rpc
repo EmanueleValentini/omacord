@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""Bridge between Discord's local RPC socket and the Omarchy shell.
+
+Discord speaks a length-prefixed binary framing over a unix socket, which a
+QML `Socket` (a text stream) cannot carry. So the shell runs this instead:
+newline-delimited JSON out on stdout, newline-delimited JSON commands in on
+stdin, and every reconnect, token refresh and subscription handled here.
+
+Out (one object per line):
+  {"type": "state",  ...}          full snapshot, emitted on every change
+  {"type": "notification", ...}    one mention / DM, as Discord raises it
+  {"type": "log", "message": ...}  diagnostics for the panel
+
+In:
+  {"cmd": "setMute", "value": true|false|null}   null toggles
+  {"cmd": "setDeaf", "value": true|false|null}
+  {"cmd": "leaveVoice"}
+  {"cmd": "reconnect"}
+
+Credentials come from `omacord-auth` and are never written here beyond the
+refreshed access token.
+"""
+
+import errno
+import json
+import os
+import select
+import socket
+import struct
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_BASE = "https://discord.com/api/v10"
+
+OP_HANDSHAKE = 0
+OP_FRAME = 1
+OP_CLOSE = 2
+OP_PING = 3
+OP_PONG = 4
+
+# Backoff between connection attempts, in seconds. Discord being closed is
+# the normal case, not an error, so the tail is long and quiet.
+RETRY_STEPS = [2, 3, 5, 8, 13, 21, 30]
+
+SCOPES = ["rpc", "rpc.notifications.read", "rpc.voice.read", "rpc.voice.write"]
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "omacord")
+
+
+CREDENTIALS_PATH = os.path.join(state_dir(), "credentials.json")
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def log(message):
+    emit({"type": "log", "message": str(message)})
+
+
+def candidate_sockets():
+    """Every path a Discord client might have left a socket at.
+
+    The docs name XDG_RUNTIME_DIR, TMPDIR, TMP, TEMP and /tmp; sandboxed
+    builds (flatpak, snap) and the popular forks nest theirs one level down.
+    """
+    bases = []
+    for key in ("XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"):
+        value = os.environ.get(key)
+        if value:
+            bases.append(value)
+    bases.append("/tmp")
+
+    subdirs = [
+        "",
+        "app/com.discordapp.Discord",
+        "app/com.discordapp.DiscordCanary",
+        "app/dev.vencord.Vesktop",
+        "app/io.github.spacingbat3.webcord",
+        "snap.discord",
+        ".flatpak/com.discordapp.Discord/xdg-run",
+    ]
+
+    seen = set()
+    for base in bases:
+        for sub in subdirs:
+            directory = os.path.join(base, sub) if sub else base
+            for index in range(10):
+                path = os.path.join(directory, "discord-ipc-%d" % index)
+                if path in seen:
+                    continue
+                seen.add(path)
+                yield path
+
+
+def load_credentials():
+    try:
+        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        log("credentials unreadable: %s" % error)
+        return None
+    if not data.get("client_id"):
+        return None
+    return data
+
+
+def save_credentials(data):
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    temporary = CREDENTIALS_PATH + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, CREDENTIALS_PATH)
+
+
+def refresh_access_token(credentials):
+    """Trade the refresh token for a fresh access token.
+
+    Returns the updated credentials, or None when the grant is refused — the
+    only cure for which is running `omacord-auth` again.
+    """
+    if not credentials.get("refresh_token") or not credentials.get("client_secret"):
+        return None
+
+    body = urllib.parse.urlencode({
+        "client_id": credentials["client_id"],
+        "client_secret": credentials["client_secret"],
+        "grant_type": "refresh_token",
+        "refresh_token": credentials["refresh_token"],
+    }).encode()
+
+    request = urllib.request.Request(
+        API_BASE + "/oauth2/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, ValueError, OSError) as error:
+        log("token refresh failed: %s" % error)
+        return None
+
+    credentials = dict(credentials)
+    credentials["access_token"] = payload.get("access_token", "")
+    credentials["refresh_token"] = payload.get("refresh_token", credentials["refresh_token"])
+    credentials["expires_at"] = time.time() + float(payload.get("expires_in", 0) or 0)
+    try:
+        save_credentials(credentials)
+    except OSError as error:
+        log("could not persist refreshed token: %s" % error)
+    return credentials
+
+
+class Connection:
+    """One socket's worth of Discord RPC: framing, nonces, subscriptions."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = b""
+        self.nonce = 0
+        self.pending = {}
+        self.subscribed_channel = None
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def send(self, opcode, payload):
+        blob = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.sock.sendall(struct.pack("<II", opcode, len(blob)) + blob)
+
+    def command(self, cmd, args=None, callback=None, evt=None):
+        self.nonce += 1
+        nonce = "omacord-%d" % self.nonce
+        frame = {"cmd": cmd, "nonce": nonce}
+        if args is not None:
+            frame["args"] = args
+        if evt is not None:
+            frame["evt"] = evt
+        if callback is not None:
+            self.pending[nonce] = callback
+        self.send(OP_FRAME, frame)
+        return nonce
+
+    def subscribe(self, event, args=None, callback=None):
+        self.command("SUBSCRIBE", args or {}, callback, evt=event)
+
+    def unsubscribe(self, event, args=None):
+        self.command("UNSUBSCRIBE", args or {}, None, evt=event)
+
+    def read_frames(self):
+        """Drain the socket, yielding (opcode, payload) for complete frames.
+
+        Raises ConnectionError when Discord hangs up, which the caller turns
+        into a reconnect rather than an exit.
+        """
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("discord closed the socket")
+        self.buffer += chunk
+
+        while len(self.buffer) >= 8:
+            opcode, length = struct.unpack("<II", self.buffer[:8])
+            if len(self.buffer) < 8 + length:
+                return
+            body = self.buffer[8:8 + length]
+            self.buffer = self.buffer[8 + length:]
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except ValueError:
+                log("dropping unparseable frame")
+                continue
+            yield opcode, payload
+
+
+class Bridge:
+    def __init__(self):
+        self.connection = None
+        self.credentials = load_credentials()
+        self.retry_index = 0
+        self.next_attempt = 0.0
+        self.authenticate_retried = False
+        self.state = {
+            "type": "state",
+            "running": False,      # a Discord client is listening
+            "connected": False,    # handshake done
+            "authed": False,       # AUTHENTICATE accepted
+            "authRequired": self.credentials is None,
+            "user": None,
+            "voice": None,
+            "voiceSettings": {"mute": False, "deaf": False, "mode": ""},
+            "error": "",
+        }
+        self.dirty = True
+
+    # ---- state bookkeeping
+
+    def set(self, **changes):
+        for key, value in changes.items():
+            if self.state.get(key) != value:
+                self.state[key] = value
+                self.dirty = True
+
+    def flush(self):
+        if self.dirty:
+            emit(self.state)
+            self.dirty = False
+
+    def reset_connection_state(self, error=""):
+        if self.connection:
+            self.connection.close()
+            self.connection = None
+        self.authenticate_retried = False
+        self.set(running=False, connected=False, authed=False, user=None,
+                 voice=None, error=error)
+
+    # ---- connecting
+
+    def due_for_attempt(self, now):
+        return self.connection is None and now >= self.next_attempt
+
+    def schedule_retry(self):
+        delay = RETRY_STEPS[min(self.retry_index, len(RETRY_STEPS) - 1)]
+        self.retry_index += 1
+        self.next_attempt = time.monotonic() + delay
+
+    def connect(self):
+        # Credentials may have been written by `omacord-auth` since we last
+        # looked, so re-read them on every attempt rather than only at start.
+        self.credentials = load_credentials()
+        self.set(authRequired=self.credentials is None)
+        if self.credentials is None:
+            self.schedule_retry()
+            return
+
+        for path in candidate_sockets():
+            if not os.path.exists(path):
+                continue
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            try:
+                sock.connect(path)
+            except OSError as error:
+                sock.close()
+                if error.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+                    log("connect %s: %s" % (path, error))
+                continue
+
+            sock.settimeout(None)
+            self.connection = Connection(sock)
+            self.retry_index = 0
+            self.set(running=True, error="")
+            try:
+                self.connection.send(OP_HANDSHAKE, {
+                    "v": 1,
+                    "client_id": str(self.credentials["client_id"]),
+                })
+            except OSError as error:
+                self.reset_connection_state("handshake failed: %s" % error)
+                self.schedule_retry()
+            return
+
+        self.schedule_retry()
+
+    # ---- authentication
+
+    def authenticate(self):
+        token = (self.credentials or {}).get("access_token", "")
+        expires_at = (self.credentials or {}).get("expires_at", 0)
+        # Refresh a little early: a token that expires mid-handshake would
+        # otherwise cost a full reconnect cycle.
+        if token and expires_at and time.time() > float(expires_at) - 300:
+            refreshed = refresh_access_token(self.credentials)
+            if refreshed:
+                self.credentials = refreshed
+                token = refreshed.get("access_token", "")
+
+        if not token:
+            self.set(authRequired=True, error="run omacord-auth to authorize the plugin")
+            return
+
+        self.connection.command("AUTHENTICATE", {"access_token": token},
+                                self.on_authenticated)
+
+    def on_authenticated(self, frame):
+        if frame.get("evt") == "ERROR":
+            message = (frame.get("data") or {}).get("message", "authentication rejected")
+            # One shot at a refresh: an expired token looks exactly like a
+            # bad one from here, and only the refresh tells them apart.
+            if not self.authenticate_retried:
+                self.authenticate_retried = True
+                refreshed = refresh_access_token(self.credentials or {})
+                if refreshed:
+                    self.credentials = refreshed
+                    self.connection.command("AUTHENTICATE",
+                                            {"access_token": refreshed.get("access_token", "")},
+                                            self.on_authenticated)
+                    return
+            self.set(authed=False, authRequired=True, error=message)
+            return
+
+        data = frame.get("data") or {}
+        user = data.get("user") or {}
+        self.set(authed=True, authRequired=False, error="", user={
+            "id": user.get("id", ""),
+            "username": user.get("username", ""),
+            "globalName": user.get("global_name") or user.get("username", ""),
+            "avatar": user.get("avatar", ""),
+        })
+        self.after_authenticate()
+
+    def after_authenticate(self):
+        connection = self.connection
+        connection.subscribe("VOICE_CHANNEL_SELECT")
+        connection.subscribe("VOICE_SETTINGS_UPDATE")
+        connection.subscribe("NOTIFICATION_CREATE")
+        connection.command("GET_VOICE_SETTINGS", {}, self.on_voice_settings)
+        connection.command("GET_SELECTED_VOICE_CHANNEL", {}, self.on_selected_channel)
+
+    # ---- voice
+
+    def on_voice_settings(self, frame):
+        data = frame.get("data") or {}
+        if frame.get("evt") == "ERROR":
+            return
+        self.set(voiceSettings={
+            "mute": bool(data.get("mute")),
+            "deaf": bool(data.get("deaf")),
+            "mode": ((data.get("mode") or {}).get("type") or ""),
+        })
+
+    def on_selected_channel(self, frame):
+        data = frame.get("data")
+        if frame.get("evt") == "ERROR" or not data:
+            self.set_voice(None)
+            return
+        self.set_voice_from_channel(data)
+
+    def set_voice_from_channel(self, channel):
+        participants = []
+        for state in channel.get("voice_states") or []:
+            participants.append(self.participant(state))
+
+        voice = {
+            "channelId": channel.get("id", ""),
+            "channelName": channel.get("name", ""),
+            "guildId": channel.get("guild_id", "") or "",
+            "guildName": (self.state.get("voice") or {}).get("guildName", ""),
+            "participants": participants,
+        }
+        self.set_voice(voice)
+
+        if voice["guildId"]:
+            self.connection.command("GET_GUILD", {"guild_id": voice["guildId"]},
+                                    self.on_guild)
+        self.resubscribe_channel(voice["channelId"])
+
+    def on_guild(self, frame):
+        if frame.get("evt") == "ERROR":
+            return
+        data = frame.get("data") or {}
+        voice = dict(self.state.get("voice") or {})
+        if not voice or voice.get("guildId") != data.get("id"):
+            return
+        voice["guildName"] = data.get("name", "")
+        self.set_voice(voice)
+
+    def participant(self, state):
+        user = state.get("user") or {}
+        voice = state.get("voice_state") or {}
+        return {
+            "id": user.get("id", ""),
+            "name": state.get("nick") or user.get("global_name") or user.get("username", ""),
+            "mute": bool(voice.get("mute") or voice.get("self_mute")),
+            "deaf": bool(voice.get("deaf") or voice.get("self_deaf")),
+            "self": user.get("id", "") == ((self.state.get("user") or {}).get("id") or ""),
+            "speaking": False,
+        }
+
+    def set_voice(self, voice):
+        if voice is None and self.state.get("voice") is not None:
+            self.resubscribe_channel(None)
+        self.set(voice=voice)
+
+    def resubscribe_channel(self, channel_id):
+        """Per-channel events only exist while subscribed to that channel."""
+        connection = self.connection
+        if connection is None or connection.subscribed_channel == channel_id:
+            return
+
+        events = ("VOICE_STATE_CREATE", "VOICE_STATE_UPDATE", "VOICE_STATE_DELETE",
+                  "SPEAKING_START", "SPEAKING_STOP")
+        if connection.subscribed_channel:
+            args = {"channel_id": connection.subscribed_channel}
+            for event in events:
+                connection.unsubscribe(event, args)
+        if channel_id:
+            args = {"channel_id": channel_id}
+            for event in events:
+                connection.subscribe(event, args)
+        connection.subscribed_channel = channel_id
+
+    def apply_voice_state(self, event, data):
+        voice = self.state.get("voice")
+        if not voice:
+            return
+        participants = [dict(entry) for entry in voice.get("participants", [])]
+        incoming = self.participant(data)
+        index = next((i for i, entry in enumerate(participants)
+                      if entry["id"] == incoming["id"]), -1)
+
+        if event == "VOICE_STATE_DELETE":
+            if index >= 0:
+                participants.pop(index)
+        elif index >= 0:
+            incoming["speaking"] = participants[index].get("speaking", False)
+            participants[index] = incoming
+        else:
+            participants.append(incoming)
+
+        updated = dict(voice)
+        updated["participants"] = participants
+        self.set(voice=updated)
+
+    def apply_speaking(self, speaking, data):
+        voice = self.state.get("voice")
+        if not voice:
+            return
+        user_id = str(data.get("user_id", ""))
+        participants = []
+        changed = False
+        for entry in voice.get("participants", []):
+            if entry["id"] == user_id and entry.get("speaking") != speaking:
+                entry = dict(entry)
+                entry["speaking"] = speaking
+                changed = True
+            participants.append(entry)
+        if not changed:
+            return
+        updated = dict(voice)
+        updated["participants"] = participants
+        self.set(voice=updated)
+
+    # ---- inbound frames
+
+    def handle_frame(self, opcode, payload):
+        if opcode == OP_PING:
+            self.connection.send(OP_PONG, payload)
+            return
+        if opcode == OP_CLOSE:
+            raise ConnectionError((payload or {}).get("message", "closed by discord"))
+        if opcode != OP_FRAME:
+            return
+
+        nonce = payload.get("nonce")
+        if nonce and nonce in self.connection.pending:
+            self.connection.pending.pop(nonce)(payload)
+            return
+
+        event = payload.get("evt")
+        data = payload.get("data") or {}
+
+        if event == "READY":
+            self.set(connected=True)
+            self.authenticate()
+        elif event == "ERROR":
+            self.set(error=data.get("message", "rpc error"))
+        elif event == "VOICE_CHANNEL_SELECT":
+            channel_id = data.get("channel_id")
+            if channel_id:
+                self.connection.command("GET_CHANNEL", {"channel_id": channel_id},
+                                        self.on_selected_channel)
+            else:
+                self.set_voice(None)
+        elif event == "VOICE_SETTINGS_UPDATE":
+            self.on_voice_settings({"data": data})
+        elif event in ("VOICE_STATE_CREATE", "VOICE_STATE_UPDATE", "VOICE_STATE_DELETE"):
+            self.apply_voice_state(event, data)
+        elif event == "SPEAKING_START":
+            self.apply_speaking(True, data)
+        elif event == "SPEAKING_STOP":
+            self.apply_speaking(False, data)
+        elif event == "NOTIFICATION_CREATE":
+            self.emit_notification(data)
+
+    def emit_notification(self, data):
+        message = data.get("message") or {}
+        author = message.get("author") or {}
+        emit({
+            "type": "notification",
+            "id": message.get("id", "") or str(time.time()),
+            "channelId": data.get("channel_id", ""),
+            "title": data.get("title", ""),
+            "body": data.get("body", ""),
+            "icon": data.get("icon_url", ""),
+            "author": author.get("global_name") or author.get("username", ""),
+            "timestamp": time.time(),
+        })
+
+    # ---- commands from the shell
+
+    def handle_command(self, line):
+        try:
+            command = json.loads(line)
+        except ValueError:
+            return
+
+        name = command.get("cmd", "")
+        if name == "reconnect":
+            self.reset_connection_state()
+            self.retry_index = 0
+            self.next_attempt = 0
+            return
+
+        if self.connection is None or not self.state.get("authed"):
+            return
+
+        if name in ("setMute", "setDeaf"):
+            key = "mute" if name == "setMute" else "deaf"
+            value = command.get("value")
+            if value is None:
+                value = not self.state["voiceSettings"].get(key, False)
+            self.connection.command("SET_VOICE_SETTINGS", {key: bool(value)},
+                                    self.on_voice_settings)
+        elif name == "leaveVoice":
+            self.connection.command("SELECT_VOICE_CHANNEL",
+                                    {"channel_id": None, "force": True},
+                                    lambda frame: self.set_voice(None))
+
+    # ---- main loop
+
+    def run(self):
+        stdin_open = True
+        stdin_buffer = ""
+        self.flush()
+
+        while True:
+            now = time.monotonic()
+            if self.due_for_attempt(now):
+                self.connect()
+
+            readable = []
+            if self.connection:
+                readable.append(self.connection.sock)
+            if stdin_open:
+                readable.append(sys.stdin)
+
+            if not readable:
+                return
+            # Idle means no client to read from — usually someone running the
+            # web app, who will never have a socket here. Wake rarely rather
+            # than twice a second for the whole session.
+            timeout = 0.5 if self.connection else 2.0
+            ready, _, _ = select.select(readable, [], [], timeout)
+
+            for source in ready:
+                if source is sys.stdin:
+                    chunk = os.read(sys.stdin.fileno(), 65536)
+                    if not chunk:
+                        # The shell went away; so do we.
+                        return
+                    stdin_buffer += chunk.decode("utf-8", "replace")
+                    while "\n" in stdin_buffer:
+                        line, stdin_buffer = stdin_buffer.split("\n", 1)
+                        if line.strip():
+                            self.handle_command(line)
+                elif self.connection and source is self.connection.sock:
+                    try:
+                        for opcode, payload in self.connection.read_frames():
+                            self.handle_frame(opcode, payload)
+                    except (ConnectionError, OSError, struct.error) as error:
+                        self.reset_connection_state(str(error))
+                        self.schedule_retry()
+
+            self.flush()
+
+
+def main():
+    try:
+        Bridge().run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
