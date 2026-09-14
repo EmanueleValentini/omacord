@@ -33,8 +33,8 @@ Panel {
   readonly property int panelWidth: Style.space(420)
 
   readonly property string source: view ? view.source : "none"
-  readonly property bool onRpc: source === "rpc"
-  readonly property bool onWeb: source === "web"
+  readonly property bool fromRpc: source === "rpc"
+  readonly property bool fromWeb: source === "web"
   readonly property var voice: view ? view.voice : null
   readonly property var participants: voice && voice.participants ? voice.participants : []
   readonly property var notifications: rpc ? rpc.notifications : []
@@ -93,20 +93,20 @@ Panel {
 
   readonly property string heroTitle: {
     if (authRequired) return "Not authorized"
-    if (onRpc) return view.user && view.user.globalName ? view.user.globalName : "Connected"
-    if (onWeb) return "Discord web app"
+    if (fromRpc) return view.user && view.user.globalName ? view.user.globalName : "Connected"
+    if (fromWeb) return "Discord web app"
     return "Discord offline"
   }
 
   readonly property string heroSubtitle: {
     if (authRequired) return "Run omacord-auth to link your Discord application"
-    if (onRpc) {
+    if (fromRpc) {
       if (!voice) return "Not in a voice channel"
       var where = voice.channelName || "voice"
       if (voice.guildName) where = voice.guildName + " · " + where
       return where + " · " + Model.participantSummary(view)
     }
-    if (onWeb) {
+    if (fromWeb) {
       if (view.channel === "") return "Open, nothing selected"
       var viewing = Model.channelLabel(view, 40)
       return view.guild !== "" ? view.guild + " · " + viewing : viewing
@@ -243,7 +243,7 @@ Panel {
           //      hero, so this section exists to say what is missing and
           //      what it would take to get it.
           Rectangle {
-            visible: root.onWeb
+            visible: root.fromWeb
             width: parent.width
             height: webText.implicitHeight + Style.space(18)
             radius: Style.cornerRadius
@@ -266,21 +266,21 @@ Panel {
           }
 
           PanelSeparator {
-            visible: root.onRpc
+            visible: root.fromRpc
             width: parent.width
             foreground: root.contentForeground
           }
 
           // ---- Voice, desktop client only.
           PanelSectionHeader {
-            visible: root.onRpc
+            visible: root.fromRpc
             text: "VOICE"
             foreground: root.contentForeground
             fontFamily: root.contentFontFamily
           }
 
           Text {
-            visible: root.onRpc && !root.voice
+            visible: root.fromRpc && !root.voice
             width: parent.width
             text: "Join a voice channel in Discord and it shows up here."
             color: root.fainterForeground
@@ -290,7 +290,7 @@ Panel {
           }
 
           Repeater {
-            model: root.onRpc && root.voice ? root.participants : []
+            model: root.fromRpc && root.voice ? root.participants : []
 
             Item {
               required property var modelData
@@ -331,7 +331,7 @@ Panel {
           //      settings, not the local mic, so they apply whether or not
           //      you are currently in a channel.
           Row {
-            visible: root.onRpc
+            visible: root.fromRpc
             anchors.horizontalCenter: parent.horizontalCenter
             spacing: Style.space(10)
 
@@ -362,7 +362,7 @@ Panel {
           }
 
           PanelSeparator {
-            visible: root.onRpc || root.notifications.length > 0
+            visible: root.fromRpc || root.notifications.length > 0
             width: parent.width
             foreground: root.contentForeground
           }
@@ -370,14 +370,14 @@ Panel {
           // ---- Mentions. Only the desktop client raises these; the web
           //      app's count lives in the hero instead.
           PanelSectionHeader {
-            visible: root.onRpc || root.notifications.length > 0
+            visible: root.fromRpc || root.notifications.length > 0
             text: "MENTIONS"
             foreground: root.contentForeground
             fontFamily: root.contentFontFamily
           }
 
           Text {
-            visible: root.onRpc && root.notifications.length === 0
+            visible: root.fromRpc && root.notifications.length === 0
             width: parent.width
             text: "Nothing since the shell started."
             color: root.fainterForeground
