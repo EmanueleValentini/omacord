@@ -142,7 +142,12 @@ def refresh_access_token(credentials):
     request = urllib.request.Request(
         API_BASE + "/oauth2/token",
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            # Cloudflare in front of discord.com rejects the default urllib
+            # signature with a 403 (error 1010); any honest UA passes.
+            "User-Agent": "omacord (https://github.com/EmanueleValentini/omacord, 0.1.0)",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:

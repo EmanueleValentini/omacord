@@ -137,16 +137,24 @@ def exchange_code(client_id, client_secret, code, redirect_uri):
     request = urllib.request.Request(
         API_BASE + "/oauth2/token",
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            # Cloudflare in front of discord.com rejects the default urllib
+            # signature with a 403 (error 1010); any honest UA passes.
+            "User-Agent": "omacord (https://github.com/EmanueleValentini/omacord, 0.1.0)",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")
-        die("token exchange rejected (%s): %s\n"
-            "The redirect URI must match one registered on the app "
-            "(OAuth2 → Redirects)." % (error.code, detail))
+        hint = ("The redirect URI must match one registered on the app "
+                "(OAuth2 → Redirects).")
+        if "error code: 10" in detail:
+            hint = ("Blocked by Cloudflare before reaching Discord — "
+                    "check the User-Agent this script sends.")
+        die("token exchange rejected (%s): %s\n%s" % (error.code, detail, hint))
     except (urllib.error.URLError, OSError) as error:
         die("token exchange failed: %s" % error)
 
