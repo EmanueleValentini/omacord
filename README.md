@@ -170,6 +170,7 @@ Web app users who want the channel in the bar:
 | Panel says "Discord web app" | Working as intended — install the desktop client for voice readings |
 | Web app open but nothing shows | Its window must be open, not just the tab; check `hyprctl clients` names it `chrome-discord.com...` |
 | "Unauthorized" after a while | Token could not be refreshed; run `omacord-auth` again |
+| `token exchange rejected (403): error code: 1010` | Cloudflare, not Discord: it blocks requests without a browser-like `User-Agent`. Both scripts send one; if you see this, the header was lost (a proxy, a patched copy) — it is not a redirect URI problem |
 
 The bridge reconnects on its own — every few seconds at first, backing off to
 every 30 — so starting Discord after the shell is fine.
